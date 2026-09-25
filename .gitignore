@@ -1,0 +1,27 @@
+# Android Studio and Gradle
+.gradle/
+.kotlin/
+.idea/
+**/build/
+*.iml
+local.properties
+
+# OS files
+.DS_Store
+
+# Build artifacts
+*.apk
+*.aab
+
+# Health exports and private research artifacts
+exports/
+analysis/
+migration-qr.png
+
+# Local project-specific tools that are not part of the generic exporter
+scripts/__pycache__/
+scripts/build_dashboard_snapshot.py
+scripts/make_migration_qr.py
+scripts/normalize_ohealth_export.py
+scripts/ohealth_migration_receiver.py
+scripts/requirements.txt

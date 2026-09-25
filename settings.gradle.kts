@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "HealthConnectExporter"
+rootProject.name = "HealthConnectDataExporter"
 include(":app")

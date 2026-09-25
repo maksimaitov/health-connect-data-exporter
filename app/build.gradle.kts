@@ -10,9 +10,9 @@ android {
     defaultConfig {
         applicationId = "com.techlion.healthconnectexporter"
         minSdk = 28
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 1
-        versionName = "1.0"
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -49,9 +49,6 @@ dependencies {
 
     // JSON
     implementation("com.google.code.gson:gson:2.10.1")
-
-    // Work Manager for background export
-    implementation("androidx.work:work-runtime-ktx:2.9.0")
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

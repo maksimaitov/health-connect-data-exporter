@@ -2,36 +2,33 @@ package com.techlion.healthconnectexporter
 
 import android.content.Intent
 import android.os.Bundle
-import android.os.Environment
 import android.view.View
 import android.widget.Button
 import android.widget.ProgressBar
 import android.widget.TextView
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.lifecycle.lifecycleScope
-import com.google.android.material.snackbar.Snackbar
-import kotlinx.coroutines.launch
-import java.io.File
+import androidx.core.content.FileProvider
 import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.PermissionController
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
-
     private lateinit var statusText: TextView
     private lateinit var progressBar: ProgressBar
     private lateinit var exportButton: Button
-
-    private val exportWorker = ExportWorker(this)
+    private lateinit var shareButton: Button
+    private val exportWorker by lazy { ExportWorker(applicationContext) }
 
     private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
+        PermissionController.createRequestPermissionResultContract()
     ) { granted ->
-        if (granted.values.all { it }) {
+        if (granted.containsAll(exportWorker.permissions)) {
             export()
         } else {
-            statusText.text = "Permissions required to export data."
+            statusText.setText(R.string.status_permission_denied)
             exportButton.isEnabled = true
         }
     }
@@ -40,81 +37,108 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById<View>(android.R.id.content)) { v, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-            insets
-        }
-
         statusText = findViewById(R.id.statusText)
         progressBar = findViewById(R.id.progressBar)
         exportButton = findViewById(R.id.exportButton)
-
+        shareButton = findViewById(R.id.shareButton)
+        progressBar.visibility = View.GONE
         exportButton.setOnClickListener { checkAndRequestPermissions() }
+        shareButton.setOnClickListener { shareLatestExport() }
+        shareButton.isEnabled = exportWorker.hasExport()
 
-        updateStatus()
+        when (HealthConnectClient.getSdkStatus(this)) {
+            HealthConnectClient.SDK_AVAILABLE -> {
+                statusText.setText(
+                    if (exportWorker.hasExport()) R.string.status_previous_export else R.string.status_ready
+                )
+            }
+            HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED -> {
+                statusText.setText(R.string.status_provider_update)
+                exportButton.isEnabled = false
+            }
+            else -> {
+                statusText.setText(R.string.status_unavailable)
+                exportButton.isEnabled = false
+            }
+        }
     }
 
     private fun checkAndRequestPermissions() {
+        exportButton.isEnabled = false
         lifecycleScope.launch {
             if (exportWorker.hasAllPermissions()) {
                 export()
             } else {
-                val perms = exportWorker.permissions.toList()
-                permissionLauncher.launch(perms.toTypedArray())
+                exportButton.isEnabled = true
+                permissionLauncher.launch(exportWorker.permissions)
             }
         }
     }
 
     private fun export() {
-        statusText.text = "Exporting..."
+        statusText.setText(R.string.status_exporting)
         progressBar.visibility = View.VISIBLE
         exportButton.isEnabled = false
+        shareButton.isEnabled = false
 
         lifecycleScope.launch {
-            val result = exportWorker.exportAll { name, count, _ ->
-                runOnUiThread {
-                    statusText.text = "Exporting $name: $count records..."
+            try {
+                val result = exportWorker.exportAll { name, count ->
+                    runOnUiThread {
+                        statusText.text = getString(R.string.status_exported_type, name, count)
+                    }
                 }
-            }
-
-            progressBar.visibility = View.GONE
-            exportButton.isEnabled = true
-
-            result.onSuccess { total ->
-                statusText.text = "Exported $total records total."
-                shareExports()
-            }.onFailure { error ->
-                statusText.text = "Export failed: ${error.message}"
+                statusText.text = if (result.errors.isEmpty()) {
+                    getString(R.string.status_complete, result.totalRecords)
+                } else {
+                    getString(
+                        R.string.status_complete_with_errors,
+                        result.totalRecords,
+                        result.errors.size
+                    )
+                }
+                shareButton.isEnabled = true
+            } catch (error: Exception) {
+                statusText.text = getString(
+                    R.string.status_failed,
+                    error.message ?: error::class.java.simpleName
+                )
+            } finally {
+                progressBar.visibility = View.GONE
+                exportButton.isEnabled = true
             }
         }
     }
 
-    private fun shareExports() {
-        val exportDir = File(getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), "HealthConnectExport")
-        val files = exportDir.listFiles() ?: return
-        if (files.isEmpty()) {
-            Snackbar.make(findViewById<View>(android.R.id.content), "No exports found", Snackbar.LENGTH_SHORT).show()
-            return
-        }
-        val uris = files.map {
-            androidx.core.content.FileProvider.getUriForFile(this, "${packageName}.fileprovider", it)
-        }
-        val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-            type = "text/csv"
-            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        startActivity(Intent.createChooser(intent, "Share Health Connect Export"))
-    }
-
-    private fun updateStatus() {
-        val exportDir = File(getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), "HealthConnectExport")
-        val files = exportDir.listFiles()
-        statusText.text = if (files.isNullOrEmpty()) {
-            "Grant permissions and tap Export."
-        } else {
-            "${files.size} export files ready."
+    private fun shareLatestExport() {
+        shareButton.isEnabled = false
+        statusText.setText(R.string.status_preparing_archive)
+        lifecycleScope.launch {
+            try {
+                val archive = withContext(Dispatchers.IO) {
+                    exportWorker.createShareArchive()
+                }
+                val uri = FileProvider.getUriForFile(
+                    this@MainActivity,
+                    "$packageName.fileprovider",
+                    archive
+                )
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "application/zip"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_SUBJECT, getString(R.string.share_subject))
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                startActivity(Intent.createChooser(intent, getString(R.string.share_title)))
+                statusText.setText(R.string.status_previous_export)
+            } catch (error: Exception) {
+                statusText.text = getString(
+                    R.string.status_share_failed,
+                    error.message ?: error::class.java.simpleName
+                )
+            } finally {
+                shareButton.isEnabled = exportWorker.hasExport()
+            }
         }
     }
 }

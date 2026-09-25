@@ -1,181 +1,429 @@
 package com.techlion.healthconnectexporter
 
 import android.content.Context
-import android.os.Environment
 import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.HealthConnectFeatures
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
-import androidx.health.connect.client.records.BasalBodyTemperatureRecord
-import androidx.health.connect.client.records.BloodGlucoseRecord
-import androidx.health.connect.client.records.BloodPressureRecord
-import androidx.health.connect.client.records.BodyFatRecord
 import androidx.health.connect.client.records.DistanceRecord
+import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.HeartRateRecord
+import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
 import androidx.health.connect.client.records.HeightRecord
-import androidx.health.connect.client.records.HydrationRecord
-import androidx.health.connect.client.records.NutritionRecord
 import androidx.health.connect.client.records.OxygenSaturationRecord
+import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.RespiratoryRateRecord
 import androidx.health.connect.client.records.RestingHeartRateRecord
 import androidx.health.connect.client.records.SleepSessionRecord
 import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
+import androidx.health.connect.client.records.Vo2MaxRecord
 import androidx.health.connect.client.records.WeightRecord
+import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.request.ReadRecordsRequest
-import androidx.health.connect.client.filter.TimeRangeFilter
+import androidx.health.connect.client.time.TimeRangeFilter
+import com.google.gson.GsonBuilder
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.BufferedWriter
 import java.io.File
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
-import kotlin.reflect.KClass
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
-class ExportWorker(private val context: Context) {
+/**
+ * Lossless-enough exporter for common Health Connect health and fitness record types.
+ * Each output line is an independent JSON object so large histories can be streamed safely.
+ */
+class ExportWorker(context: Context) {
+    private val appContext = context.applicationContext
+    private val client = HealthConnectClient.getOrCreate(appContext)
+    private val gson = GsonBuilder().disableHtmlEscaping().create()
 
-    private val healthConnectClient = HealthConnectClient.getOrCreate(context)
+    val permissions: Set<String>
+        get() = buildSet {
+            supportedRecordTypes.forEach { add(HealthPermission.getReadPermission(it)) }
+            if (client.features.getFeatureStatus(
+                    HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_HISTORY
+                ) == HealthConnectFeatures.FEATURE_STATUS_AVAILABLE
+            ) {
+                add(HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY)
+            }
+        }
 
-    private val permissions = setOf(
-        HealthPermission.getReadPermission(StepsRecord::class),
-        HealthPermission.getReadPermission(ActiveCaloriesBurnedRecord::class),
-        HealthPermission.getReadPermission(TotalCaloriesBurnedRecord::class),
-        HealthPermission.getReadPermission(HeartRateRecord::class),
-        HealthPermission.getReadPermission(RestingHeartRateRecord::class),
-        HealthPermission.getReadPermission(SleepSessionRecord::class),
-        HealthPermission.getReadPermission(HydrationRecord::class),
-        HealthPermission.getReadPermission(NutritionRecord::class),
-        HealthPermission.getReadPermission(WeightRecord::class),
-        HealthPermission.getReadPermission(HeightRecord::class),
-        HealthPermission.getReadPermission(BloodGlucoseRecord::class),
-        HealthPermission.getReadPermission(BloodPressureRecord::class),
-        HealthPermission.getReadPermission(BasalBodyTemperatureRecord::class),
-        HealthPermission.getReadPermission(OxygenSaturationRecord::class),
-        HealthPermission.getReadPermission(RespiratoryRateRecord::class),
-        HealthPermission.getReadPermission(BodyFatRecord::class),
-        HealthPermission.getReadPermission(DistanceRecord::class)
-    )
+    suspend fun grantedPermissions(): Set<String> =
+        client.permissionController.getGrantedPermissions()
 
-    suspend fun hasAllPermissions(): Boolean {
-        return healthConnectClient.permissionController.getGrantedPermissions()
-            .containsAll(permissions)
+    suspend fun hasAllPermissions(): Boolean =
+        grantedPermissions().containsAll(permissions)
+
+    fun exportDirectory(): File = File(appContext.filesDir, EXPORT_DIRECTORY)
+
+    fun hasExport(): Boolean = exportDirectory().listFiles()?.any { file ->
+        file.isFile && (file.extension == "ndjson" || file.extension == "json")
+    } == true
+
+    fun createShareArchive(): File {
+        val sourceFiles = exportDirectory().listFiles()
+            ?.filter { it.isFile && (it.extension == "ndjson" || it.extension == "json") }
+            ?.sortedBy { it.name }
+            .orEmpty()
+        require(sourceFiles.isNotEmpty()) { "No completed export was found" }
+
+        val shareDirectory = File(appContext.cacheDir, SHARE_DIRECTORY).apply { mkdirs() }
+        shareDirectory.listFiles()?.forEach { file ->
+            if (file.isFile && file.extension == "zip") file.delete()
+        }
+        val timestamp = ARCHIVE_TIMESTAMP.format(Instant.now())
+        val archive = File(shareDirectory, "health-connect-export-$timestamp.zip")
+
+        ZipOutputStream(archive.outputStream().buffered()).use { zip ->
+            sourceFiles.forEach { file ->
+                zip.putNextEntry(ZipEntry(file.name))
+                file.inputStream().buffered().use { input -> input.copyTo(zip) }
+                zip.closeEntry()
+            }
+        }
+        return archive
     }
 
-    suspend fun exportAll(callback: (String, Int, Int) -> Unit): Result<Int> = withContext(Dispatchers.IO) {
-        try {
-            var totalRecords = 0
-            val epochStart = Instant.EPOCH
-
-            val recordHandlers: List<Pair<String, suspend (String) -> Int>> = listOf(
-                "steps" to { name -> readAndExport<StepsRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.count},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "activeCaloriesBurned" to { name -> readAndExport<ActiveCaloriesBurnedRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.energy.inKilocalories},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "totalCaloriesBurned" to { name -> readAndExport<TotalCaloriesBurnedRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.energy.inKilocalories},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "heartRate" to { name -> readAndExport<HeartRateRecord>(name, epochStart) { rec ->
-                    val samples = rec.samples.joinToString(";") { "${it.time}:${it.beatsPerMinute}" }
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},$samples,${rec.metadata.dataOrigin.packageName}"
-                }},
-                "restingHeartRate" to { name -> readAndExport<RestingHeartRateRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.measuredValue},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "sleepSession" to { name -> readAndExport<SleepSessionRecord>(name, epochStart) { rec ->
-                    val stages = rec.stages.joinToString(";") { "${it.stage.name}=${formatTime(it.startTime)}" }
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.title ?: "Sleep"},$stages,${rec.metadata.dataOrigin.packageName}"
-                }},
-                "hydration" to { name -> readAndExport<HydrationRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.volume.inMilliliters},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "nutrition" to { name -> readAndExport<NutritionRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.energy?.inKilocalories ?: 0},${rec.protein?.inGrams ?: 0},${rec.totalCarbohydrate?.inGrams ?: 0},${rec.totalFat?.inGrams ?: 0},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "weight" to { name -> readAndExport<WeightRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.time)},${rec.weight.inKilograms},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "height" to { name -> readAndExport<HeightRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.time)},${rec.height.inMeters},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "bloodGlucose" to { name -> readAndExport<BloodGlucoseRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.time)},${rec.level.inMillimolesPerLiter},${rec.specimenSource?.name ?: ""},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "bloodPressure" to { name -> readAndExport<BloodPressureRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.diastolic?.inMillimetersOfMercury ?: 0},${rec.systolic?.inMillimetersOfMercury ?: 0},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "basalBodyTemperature" to { name -> readAndExport<BasalBodyTemperatureRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.time)},${rec.measurement.inCelsius},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "oxygenSaturation" to { name -> readAndExport<OxygenSaturationRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.percentage?.value?.times(100) ?: 0},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "respiratoryRate" to { name -> readAndExport<RespiratoryRateRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.measurement?.rate ?: 0},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "bodyFat" to { name -> readAndExport<BodyFatRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.time)},${rec.percentage?.value?.times(100) ?: 0},${rec.metadata.dataOrigin.packageName}"
-                }},
-                "distance" to { name -> readAndExport<DistanceRecord>(name, epochStart) { rec ->
-                    "${formatTime(rec.startTime)},${formatTime(rec.endTime)},${rec.distance.inMeters},${rec.metadata.dataOrigin.packageName}"
-                }}
-            )
-
-            for ((index, handler) in recordHandlers.withIndex()) {
-                val fileName = handler.first
-                val count = handler.second(fileName)
-                if (count > 0) {
-                    callback(fileName, count, index + 1)
-                    totalRecords += count
+    suspend fun exportAll(onProgress: (String, Int) -> Unit): ExportResult =
+        withContext(Dispatchers.IO) {
+            val directory = exportDirectory().apply { mkdirs() }
+            directory.listFiles()?.forEach { file ->
+                if (file.isFile && (file.extension == "ndjson" || file.extension == "json")) {
+                    file.delete()
                 }
             }
 
-            Result.success(totalRecords)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
+            val startedAt = Instant.now()
+            writeStatus("running", startedAt, null, null)
+            val counts = linkedMapOf<String, Int>()
+            val errors = linkedMapOf<String, String>()
 
-    private suspend inline fun <reified T : androidx.health.connect.client.records.Record> readAndExport(
+            suspend fun run(name: String, block: suspend () -> Int) {
+                try {
+                    val count = block()
+                    counts[name] = count
+                    onProgress(name, count)
+                } catch (error: Exception) {
+                    counts[name] = 0
+                    errors[name] = "${error::class.java.simpleName}: ${error.message ?: "unknown error"}"
+                    onProgress(name, 0)
+                }
+            }
+
+            run("heart_rate") {
+                readAndWrite<HeartRateRecord>("heart_rate") { record ->
+                    intervalBase("HeartRateRecord", record, record.startTime, record.endTime,
+                        record.startZoneOffset?.toString(), record.endZoneOffset?.toString()).apply {
+                        add("samples", JsonArray().also { samples ->
+                            record.samples.forEach { sample ->
+                                samples.add(JsonObject().apply {
+                                    addProperty("time", sample.time.toString())
+                                    addProperty("beatsPerMinute", sample.beatsPerMinute)
+                                })
+                            }
+                        })
+                    }
+                }
+            }
+            run("resting_heart_rate") {
+                readAndWrite<RestingHeartRateRecord>("resting_heart_rate") { record ->
+                    instantBase("RestingHeartRateRecord", record, record.time,
+                        record.zoneOffset?.toString()).apply {
+                        addProperty("beatsPerMinute", record.beatsPerMinute)
+                    }
+                }
+            }
+            run("heart_rate_variability_rmssd") {
+                readAndWrite<HeartRateVariabilityRmssdRecord>("heart_rate_variability_rmssd") { record ->
+                    instantBase("HeartRateVariabilityRmssdRecord", record, record.time,
+                        record.zoneOffset?.toString()).apply {
+                        addProperty("heartRateVariabilityMillis", record.heartRateVariabilityMillis)
+                    }
+                }
+            }
+            run("sleep_session") {
+                readAndWrite<SleepSessionRecord>("sleep_session") { record ->
+                    intervalBase("SleepSessionRecord", record, record.startTime, record.endTime,
+                        record.startZoneOffset?.toString(), record.endZoneOffset?.toString()).apply {
+                        addNullable("title", record.title)
+                        addNullable("notes", record.notes)
+                        add("stages", JsonArray().also { stages ->
+                            record.stages.forEach { stage ->
+                                stages.add(JsonObject().apply {
+                                    addProperty("startTime", stage.startTime.toString())
+                                    addProperty("endTime", stage.endTime.toString())
+                                    addProperty("stage", stage.stage)
+                                    addProperty("stageName", sleepStageName(stage.stage))
+                                })
+                            }
+                        })
+                    }
+                }
+            }
+            run("oxygen_saturation") {
+                readAndWrite<OxygenSaturationRecord>("oxygen_saturation") { record ->
+                    instantBase("OxygenSaturationRecord", record, record.time,
+                        record.zoneOffset?.toString()).apply {
+                        addProperty("percentage", record.percentage.value)
+                    }
+                }
+            }
+            run("respiratory_rate") {
+                readAndWrite<RespiratoryRateRecord>("respiratory_rate") { record ->
+                    instantBase("RespiratoryRateRecord", record, record.time,
+                        record.zoneOffset?.toString()).apply {
+                        addProperty("ratePerMinute", record.rate)
+                    }
+                }
+            }
+            run("weight") {
+                readAndWrite<WeightRecord>("weight") { record ->
+                    instantBase("WeightRecord", record, record.time,
+                        record.zoneOffset?.toString()).apply {
+                        addProperty("kilograms", record.weight.inKilograms)
+                    }
+                }
+            }
+            run("height") {
+                readAndWrite<HeightRecord>("height") { record ->
+                    instantBase("HeightRecord", record, record.time,
+                        record.zoneOffset?.toString()).apply {
+                        addProperty("meters", record.height.inMeters)
+                    }
+                }
+            }
+            run("steps") {
+                readAndWrite<StepsRecord>("steps") { record ->
+                    intervalBase("StepsRecord", record, record.startTime, record.endTime,
+                        record.startZoneOffset?.toString(), record.endZoneOffset?.toString()).apply {
+                        addProperty("count", record.count)
+                    }
+                }
+            }
+            run("distance") {
+                readAndWrite<DistanceRecord>("distance") { record ->
+                    intervalBase("DistanceRecord", record, record.startTime, record.endTime,
+                        record.startZoneOffset?.toString(), record.endZoneOffset?.toString()).apply {
+                        addProperty("meters", record.distance.inMeters)
+                    }
+                }
+            }
+            run("active_calories") {
+                readAndWrite<ActiveCaloriesBurnedRecord>("active_calories") { record ->
+                    intervalBase("ActiveCaloriesBurnedRecord", record, record.startTime, record.endTime,
+                        record.startZoneOffset?.toString(), record.endZoneOffset?.toString()).apply {
+                        addProperty("kilocalories", record.energy.inKilocalories)
+                    }
+                }
+            }
+            run("total_calories") {
+                readAndWrite<TotalCaloriesBurnedRecord>("total_calories") { record ->
+                    intervalBase("TotalCaloriesBurnedRecord", record, record.startTime, record.endTime,
+                        record.startZoneOffset?.toString(), record.endZoneOffset?.toString()).apply {
+                        addProperty("kilocalories", record.energy.inKilocalories)
+                    }
+                }
+            }
+            run("vo2_max") {
+                readAndWrite<Vo2MaxRecord>("vo2_max") { record ->
+                    instantBase("Vo2MaxRecord", record, record.time,
+                        record.zoneOffset?.toString()).apply {
+                        addProperty("millilitersPerMinuteKilogram", record.vo2MillilitersPerMinuteKilogram)
+                        addProperty("measurementMethod", record.measurementMethod)
+                    }
+                }
+            }
+            run("exercise_session") {
+                readAndWrite<ExerciseSessionRecord>("exercise_session") { record ->
+                    intervalBase("ExerciseSessionRecord", record, record.startTime, record.endTime,
+                        record.startZoneOffset?.toString(), record.endZoneOffset?.toString()).apply {
+                        addProperty("exerciseType", record.exerciseType)
+                        addNullable("title", record.title)
+                        addNullable("notes", record.notes)
+                        add("segments", JsonArray().also { segments ->
+                            record.segments.forEach { segment ->
+                                segments.add(JsonObject().apply {
+                                    addProperty("startTime", segment.startTime.toString())
+                                    addProperty("endTime", segment.endTime.toString())
+                                    addProperty("segmentType", segment.segmentType)
+                                    addProperty("repetitions", segment.repetitions)
+                                })
+                            }
+                        })
+                        add("laps", JsonArray().also { laps ->
+                            record.laps.forEach { lap ->
+                                laps.add(JsonObject().apply {
+                                    addProperty("startTime", lap.startTime.toString())
+                                    addProperty("endTime", lap.endTime.toString())
+                                    lap.length?.let { addProperty("lengthMeters", it.inMeters) }
+                                })
+                            }
+                        })
+                        addProperty("exerciseRouteResult", record.exerciseRouteResult::class.java.simpleName)
+                    }
+                }
+            }
+
+            val finishedAt = Instant.now()
+            val manifest = JsonObject().apply {
+                addProperty("schemaVersion", SCHEMA_VERSION)
+                addProperty("startedAt", startedAt.toString())
+                addProperty("finishedAt", finishedAt.toString())
+                addProperty("totalRecords", counts.values.sum())
+                add("recordCounts", gson.toJsonTree(counts))
+                add("errors", gson.toJsonTree(errors))
+                add("grantedPermissions", gson.toJsonTree(grantedPermissions().sorted()))
+            }
+            File(directory, "manifest.json").writeText(gson.toJson(manifest))
+            val result = ExportResult(counts.values.sum(), counts, errors, directory)
+            writeStatus("complete", startedAt, finishedAt, result)
+            result
+        }
+
+    private suspend inline fun <reified T : Record> readAndWrite(
         fileName: String,
-        startTime: Instant,
-        crossinline toLine: (T) -> String
+        crossinline toJson: (T) -> JsonObject
     ): Int {
+        val output = File(exportDirectory(), "$fileName.ndjson")
         var pageToken: String? = null
         var count = 0
-        val file = getExportFile(fileName)
-        file.delete()
-
-        do {
-            val request = ReadRecordsRequest(
-                recordType = T::class,
-                timeRangeFilter = TimeRangeFilter.after(startTime),
-                pageSize = 5000,
-                pageToken = pageToken
-            )
-            val response = healthConnectClient.readRecords(request)
-            for (record in response.records) {
-                file.appendText(toLine(record as T) + "\n")
-                count++
-            }
-            pageToken = response.pageToken
-        } while (pageToken != null)
-
+        output.bufferedWriter().use { writer ->
+            do {
+                val response = client.readRecords(
+                    ReadRecordsRequest(
+                        recordType = T::class,
+                        timeRangeFilter = TimeRangeFilter.after(Instant.EPOCH),
+                        pageSize = 1000,
+                        pageToken = pageToken
+                    )
+                )
+                response.records.forEach { record ->
+                    writer.write(gson.toJson(toJson(record)))
+                    writer.newLine()
+                    count++
+                }
+                writer.flush()
+                pageToken = response.pageToken
+            } while (pageToken != null)
+        }
         return count
     }
 
-    private fun getExportFile(name: String): File {
-        val exportDir = File(
-            context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS),
-            "HealthConnectExport"
-        )
-        exportDir.mkdirs()
-        return File(exportDir, "${name}.csv")
+    private fun intervalBase(
+        type: String,
+        record: Record,
+        start: Instant,
+        end: Instant,
+        startZoneOffset: String?,
+        endZoneOffset: String?
+    ): JsonObject = base(type, record.metadata).apply {
+        addProperty("startTime", start.toString())
+        addProperty("endTime", end.toString())
+        addNullable("startZoneOffset", startZoneOffset)
+        addNullable("endZoneOffset", endZoneOffset)
     }
 
-    private fun formatTime(time: Instant): String {
-        return DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+    private fun instantBase(
+        type: String,
+        record: Record,
+        time: Instant,
+        zoneOffset: String?
+    ): JsonObject = base(type, record.metadata).apply {
+        addProperty("time", time.toString())
+        addNullable("zoneOffset", zoneOffset)
+    }
+
+    private fun base(type: String, metadata: Metadata): JsonObject = JsonObject().apply {
+        addProperty("schemaVersion", SCHEMA_VERSION)
+        addProperty("recordType", type)
+        add("metadata", JsonObject().apply {
+            addProperty("id", metadata.id)
+            addProperty("dataOriginPackage", metadata.dataOrigin.packageName)
+            addProperty("lastModifiedTime", metadata.lastModifiedTime.toString())
+            addNullable("clientRecordId", metadata.clientRecordId)
+            addProperty("clientRecordVersion", metadata.clientRecordVersion)
+            addProperty("recordingMethod", metadata.recordingMethod)
+            metadata.device?.let { device ->
+                add("device", JsonObject().apply {
+                    addProperty("type", device.type)
+                    addNullable("manufacturer", device.manufacturer)
+                    addNullable("model", device.model)
+                })
+            }
+        })
+    }
+
+    private fun JsonObject.addNullable(name: String, value: String?) {
+        if (value == null) add(name, null) else addProperty(name, value)
+    }
+
+    private fun sleepStageName(stage: Int): String = when (stage) {
+        SleepSessionRecord.STAGE_TYPE_AWAKE -> "AWAKE"
+        SleepSessionRecord.STAGE_TYPE_SLEEPING -> "SLEEPING"
+        SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> "OUT_OF_BED"
+        SleepSessionRecord.STAGE_TYPE_LIGHT -> "LIGHT"
+        SleepSessionRecord.STAGE_TYPE_DEEP -> "DEEP"
+        SleepSessionRecord.STAGE_TYPE_REM -> "REM"
+        SleepSessionRecord.STAGE_TYPE_AWAKE_IN_BED -> "AWAKE_IN_BED"
+        else -> "UNKNOWN"
+    }
+
+    private fun writeStatus(
+        state: String,
+        startedAt: Instant,
+        finishedAt: Instant?,
+        result: ExportResult?
+    ) {
+        val status = JsonObject().apply {
+            addProperty("state", state)
+            addProperty("startedAt", startedAt.toString())
+            finishedAt?.let { addProperty("finishedAt", it.toString()) }
+            result?.let {
+                addProperty("totalRecords", it.totalRecords)
+                add("recordCounts", gson.toJsonTree(it.recordCounts))
+                add("errors", gson.toJsonTree(it.errors))
+            }
+        }
+        File(exportDirectory(), "status.json").writeText(gson.toJson(status))
+    }
+
+    data class ExportResult(
+        val totalRecords: Int,
+        val recordCounts: Map<String, Int>,
+        val errors: Map<String, String>,
+        val directory: File
+    )
+
+    companion object {
+        private const val EXPORT_DIRECTORY = "health_export"
+        private const val SHARE_DIRECTORY = "shared_exports"
+        private const val SCHEMA_VERSION = "1.0"
+        private val ARCHIVE_TIMESTAMP = DateTimeFormatter
+            .ofPattern("yyyyMMdd-HHmmss")
             .withZone(ZoneOffset.UTC)
-            .format(time)
+
+        private val supportedRecordTypes = listOf(
+            HeartRateRecord::class,
+            RestingHeartRateRecord::class,
+            HeartRateVariabilityRmssdRecord::class,
+            SleepSessionRecord::class,
+            OxygenSaturationRecord::class,
+            RespiratoryRateRecord::class,
+            WeightRecord::class,
+            HeightRecord::class,
+            StepsRecord::class,
+            DistanceRecord::class,
+            ActiveCaloriesBurnedRecord::class,
+            TotalCaloriesBurnedRecord::class,
+            Vo2MaxRecord::class,
+            ExerciseSessionRecord::class
+        )
     }
 }
