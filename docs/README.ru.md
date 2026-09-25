@@ -49,8 +49,8 @@ Health Connect. Оно не привязано к производителю т�
 Потребуются JDK 17, Android SDK 36 и `adb`.
 
 ```bash
-git clone https://github.com/TechLionDev/HealthConnectExporter.git
-cd HealthConnectExporter
+git clone https://github.com/maksimaitov/health-connect-data-exporter.git
+cd health-connect-data-exporter
 ./gradlew :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
